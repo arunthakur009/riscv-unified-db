@@ -7,6 +7,7 @@
 #include <sys/param.h>
 
 #include "udb/GDBServer.hpp"
+#include "udb/endian.hpp"
 
 #define GDB_CMD_PACKET_START '$'
 #define GDB_CMD_PACKET_END '#'
@@ -238,6 +239,7 @@ int GDBServer::HandlePacket(GDBPacket& packet)
 {
   int result;
   const unsigned char cmd = packet[1];
+  packet.Reset();
 
   switch(cmd)
   {
@@ -268,7 +270,12 @@ int GDBServer::HandlePacket(GDBPacket& packet)
       if(result >= 0)
       {
         GDBPacket responsePacket(m_respBuffer, 0, sizeof(m_respBuffer));
-        result = responsePacket.Write((const unsigned char*)&regFile.xReg[0],regFile.nXRegs * sizeof(regFile.xReg[0]));
+        uint8_t regBytes[32 * sizeof(uint64_t)];
+        for(int i = 0 ; i < regFile.nXRegs ; i++)
+        {
+          udb::write_le64(&regBytes[i * sizeof(uint64_t)], regFile.xReg[i]);
+        }
+        result = responsePacket.Write(regBytes, regFile.nXRegs * sizeof(uint64_t));
         if(result >= 0)
         {
          result = SendResponse(responsePacket);
@@ -286,14 +293,25 @@ int GDBServer::HandlePacket(GDBPacket& packet)
       //Write General purpose registers
       REGISTERFILE regFile;
       regFile.nXRegs = 0;
+      bool malformed = false;
       for(int i = 0 ; i < NUM_XREGS ; i++)
       {
-        if(packet.ReadData((unsigned char*)&regFile.xReg[i], sizeof(regFile.xReg[i])) < -1)
-          regFile.nXRegs++;
-        else
+        if(packet.EndOfPacket())
           break;
+        uint8_t regBytes[sizeof(uint64_t)];
+        int bytesRead = packet.ReadData(regBytes, sizeof(regBytes));
+        if(bytesRead == sizeof(regBytes))
+        {
+          regFile.xReg[i] = udb::read_le64(regBytes);
+          regFile.nXRegs++;
+        }
+        else
+        {
+          malformed = true;
+          break;
+        }
       }
-      if(regFile.nXRegs > 0)
+      if(!malformed && regFile.nXRegs > 0 && packet.EndOfPacket())
       {
         result = OnWriteGPR(regFile);
         if(result >= 0)
@@ -350,13 +368,17 @@ int GDBServer::HandlePacket(GDBPacket& packet)
               {
                 //Provide the data to the SoC
                 result = packet.ReadData(pMemBuffer, uiLen);
-                if(result >= 0)
+                if(result == (int)uiLen && packet.EndOfPacket())
                 {
                   result = OnWriteMemory(uiAddress, uiLen, pMemBuffer);
                   if(result >= 0)
                   {
                     SendResponse("OK");
                   }
+                }
+                else
+                {
+                  result = -1;
                 }
               }
               else
@@ -392,7 +414,9 @@ int GDBServer::HandlePacket(GDBPacket& packet)
       if(result >= 0)
       {
         GDBPacket responsePacket(m_respBuffer, 0, sizeof(m_respBuffer));
-        result = responsePacket.Write((unsigned char*) &regValue, sizeof(regValue));
+        uint8_t regBytes[sizeof(regValue)];
+        udb::write_le64(regBytes, regValue);
+        result = responsePacket.Write(regBytes, sizeof(regBytes));
         if(result >= 0)
         {
           //Send the response
@@ -411,13 +435,18 @@ int GDBServer::HandlePacket(GDBPacket& packet)
       int iReg = packet.Read<int>();
       if(packet.Seek('='))
       {
-        uint64_t regValue;
-        result = packet.ReadData((unsigned char*)&regValue, sizeof(regValue));
-        if(result >= 0)
+        uint8_t regBytes[sizeof(uint64_t)];
+        int bytesRead = packet.ReadData(regBytes, sizeof(regBytes));
+        if(bytesRead == sizeof(regBytes) && packet.EndOfPacket())
         {
+          uint64_t regValue = udb::read_le64(regBytes);
           result = OnWriteSingleRegister(iReg, regValue);
           if(result >= 0)
             result = SendResponse("OK");
+        }
+        else
+        {
+          result = -1;
         }
       }
       else
@@ -630,7 +659,8 @@ int GDBServer::SendError(int error)
   {
     if(error < 0)
       error = -error;
-    result = response.Write((unsigned char*)&error, sizeof(unsigned char));
+    uint8_t errByte = static_cast<uint8_t>(error & 0xff);
+    result = response.Write(&errByte, sizeof(errByte));
     if(result >= 0)
     {
       result = SendResponse(response);
@@ -733,16 +763,15 @@ bool GDBPacket::Validate()
     for(i = 1, checksum = 0 ; i < m_len && m_pPacket[i] != GDB_CMD_PACKET_END ; i++)
       checksum += m_pPacket[i];
 
-    if(m_pPacket[i] == GDB_CMD_PACKET_END)
+    if(i < m_len && m_pPacket[i] == GDB_CMD_PACKET_END)
     {
-      if(i <= (m_len - 2))
+      if(i <= (m_len - 3))
       {
-        unsigned char packetChecksum;
-        //Skip over the terminator;
-        i++;
-        if(ReadByte(&packetChecksum, &m_pPacket[i]) != -1 &&
-          packetChecksum == checksum)
+        int hi = HexCharToValue(m_pPacket[i + 1]);
+        int lo = HexCharToValue(m_pPacket[i + 2]);
+        if(hi >= 0 && lo >= 0 && (unsigned char)((hi << 4) | lo) == checksum)
         {
+          Reset();
           return true;
         }
       }
@@ -756,6 +785,11 @@ bool GDBPacket::Validate()
   return false;
 }
 
+void GDBPacket::Reset()
+{
+  m_pNextPos = (m_len >= 2) ? (m_pPacket + 2) : (m_pPacket + m_len);
+}
+
 void GDBPacket::SetBufferSize(size_t size)
 {
   m_size = size;
@@ -763,26 +797,29 @@ void GDBPacket::SetBufferSize(size_t size)
 
 int GDBPacket::ReadByte(unsigned char* pValue, unsigned char* pBuffer)
 {
-  int result = -1;
-
   if(pBuffer != NULL)
     m_pNextPos = pBuffer;
 
-  if(m_pNextPos >= m_pPacket && m_pNextPos < (m_pPacket + m_len))
-  {
-    result = HexCharToValue(m_pNextPos[0]) << 4;
-    result |= HexCharToValue(m_pNextPos[1]);
+  if(m_pPacket == NULL || m_pNextPos < m_pPacket || m_pNextPos > m_pPacket + m_len)
+    return -1;
 
-    if(result >= 0)
-    {
-      *pValue = (unsigned char)(result & 0xff);
-      m_pNextPos += 2;
-    }
-    else
-    {
-      result = -1;
-    }
-  }
+  size_t remaining = static_cast<size_t>((m_pPacket + m_len) - m_pNextPos);
+  if(remaining < 2)
+    return -1;
+
+  if(m_pNextPos[0] == GDB_CMD_PACKET_END || m_pNextPos[1] == GDB_CMD_PACKET_END)
+    return -1;
+
+  int hi = HexCharToValue(m_pNextPos[0]);
+  int lo = HexCharToValue(m_pNextPos[1]);
+
+  if(hi < 0 || lo < 0)
+    return -1;
+
+  int result = (hi << 4) | lo;
+  if(pValue != NULL)
+    *pValue = static_cast<unsigned char>(result & 0xff);
+  m_pNextPos += 2;
   return result;
 }
 
@@ -798,22 +835,35 @@ char GDBPacket::ReadChar()
 
 int GDBPacket::ReadData(unsigned char* pData, int len, unsigned char* pBuffer)
 {
-  int result = 0;
-
   if(pBuffer != NULL)
     m_pNextPos = pBuffer;
 
-  if(m_pNextPos >= m_pPacket && m_pNextPos < (m_pPacket + m_len - 2 * len))
-  {
-    while(result < len && ReadByte(pData++) != -1)
-      result++;
+  if(len < 0)
+    return -1;
 
-    if(result == 0) //No bytes read
-      result = -1;
-  }
-  else
+  if(len == 0)
+    return 0;
+
+  if(pData == NULL)
+    return -1;
+
+  if(m_pPacket == NULL || m_pNextPos < m_pPacket || m_pNextPos > m_pPacket + m_len)
+    return -1;
+
+  if(static_cast<size_t>(len) > (SIZE_MAX / 2))
+    return -1;
+
+  size_t remaining = static_cast<size_t>((m_pPacket + m_len) - m_pNextPos);
+  size_t requiredChars = static_cast<size_t>(len) * 2;
+  if(remaining < requiredChars)
+    return -1;
+
+  int result = 0;
+  while(result < len)
   {
-    result = -1;
+    if(ReadByte(pData++) == -1)
+      return -1;
+    result++;
   }
   return result;
 }
@@ -865,9 +915,9 @@ GDBPacket::operator unsigned char*()
   return m_pPacket;
 }
 
-char GDBPacket::HexCharToValue(unsigned char hexChar)
+int GDBPacket::HexCharToValue(unsigned char hexChar)
 {
-  char result = 0;
+  int result = 0;
   if(hexChar >= '0' && hexChar <= '9')
     result = hexChar - '0';
   else if (hexChar >= 'a' && hexChar <= 'f')
