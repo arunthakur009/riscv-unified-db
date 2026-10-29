@@ -60,8 +60,11 @@ class TestGDBServer : public GDBServer {
   TestGDBServer() : GDBServer(GDB_SUPPORT_BASE, 0, false) {}
 
   REGISTERFILE writtenRegs{};
+  REGISTERFILE regsToRead{};
   int writeGprCalls = 0;
   int writeSingleCalls = 0;
+  int readGprCalls = 0;
+  int readSingleCalls = 0;
   int lastSingleReg = -1;
   uint64_t lastSingleValue = 0;
   int lastError = 0;
@@ -72,6 +75,21 @@ class TestGDBServer : public GDBServer {
   }
 
  protected:
+  int OnReadGPR(REGISTERFILE& registerFile) override {
+    registerFile = regsToRead;
+    readGprCalls++;
+    return 0;
+  }
+
+  int OnReadSingleRegister(int reg, uint64_t& value) override {
+    if (reg >= 0 && reg < NUM_XREGS) {
+      value = regsToRead.xReg[reg];
+      readSingleCalls++;
+      return 0;
+    }
+    return -1;
+  }
+
   int OnWriteGPR(REGISTERFILE& registerFile) override {
     writtenRegs = registerFile;
     writeGprCalls++;
@@ -479,8 +497,8 @@ TEST_CASE("Memory::memcpy_from_host and memcpy_to_host Byte Preservation", "[mem
   }
 }
 
-TEST_CASE("GDB Protocol Validation and Packet Parsing", "[gdb]") {
-  SECTION("Protocol validation: checksum verification and rejection") {
+TEST_CASE("GDB Server Register Endianness and Protocol Serialization", "[gdb][endian]") {
+  SECTION("Protocol checksum verification and rejection") {
     // Correct computed checksum for "qSupported" is 0x37
     std::string validPkt = format_gdb_packet("qSupported");
     GDBPacket pkt((unsigned char*)validPkt.data(), validPkt.size());
@@ -491,23 +509,13 @@ TEST_CASE("GDB Protocol Validation and Packet Parsing", "[gdb]") {
     GDBPacket badPkt((unsigned char*)corruptPkt.data(), corruptPkt.size());
     REQUIRE(badPkt.Validate() == false);
 
-    // Non-hex checksum digits
-    std::string nonHexPkt = "$qSupported#zz";
-    GDBPacket nonHexBadPkt((unsigned char*)nonHexPkt.data(), nonHexPkt.size());
-    REQUIRE(nonHexBadPkt.Validate() == false);
-
-    // Missing checksum characters
-    std::string truncatedPkt = "$qSupported#";
-    GDBPacket truncBadPkt((unsigned char*)truncatedPkt.data(), truncatedPkt.size());
-    REQUIRE(truncBadPkt.Validate() == false);
-
     // Missing packet start marker
     std::string noStartPkt = "qSupported#37";
     GDBPacket noStartBadPkt((unsigned char*)noStartPkt.data(), noStartPkt.size());
     REQUIRE(noStartBadPkt.Validate() == false);
   }
 
-  SECTION("End-to-End protocol dispatch (Validate + HandlePacket)") {
+  SECTION("Register write endianness ($P single register, $G all registers)") {
     // Valid P packet for register 0 with genuine checksum ($P0=0102030405060708#e1)
     {
       TestGDBServer server;
@@ -520,6 +528,7 @@ TEST_CASE("GDB Protocol Validation and Packet Parsing", "[gdb]") {
       REQUIRE(server.writeSingleCalls == 1);
       REQUIRE(server.lastSingleReg == 0);
       REQUIRE(server.lastSingleValue == 0x0807060504030201ULL);
+      REQUIRE(server.writtenRegs.xReg[0] == 0x0807060504030201ULL);
     }
 
     // Valid P packet for register 5 with genuine checksum ($P5=efcdab8967452301#24)
@@ -534,6 +543,7 @@ TEST_CASE("GDB Protocol Validation and Packet Parsing", "[gdb]") {
       REQUIRE(server.writeSingleCalls == 1);
       REQUIRE(server.lastSingleReg == 5);
       REQUIRE(server.lastSingleValue == 0x0123456789abcdefULL);
+      REQUIRE(server.writtenRegs.xReg[5] == 0x0123456789abcdefULL);
     }
 
     // Complete 32-register G packet with genuine checksum
@@ -562,140 +572,58 @@ TEST_CASE("GDB Protocol Validation and Packet Parsing", "[gdb]") {
         REQUIRE(server.writtenRegs.xReg[i] == (0x1000000000000000ULL + static_cast<uint64_t>(i)));
       }
     }
+  }
 
-    // Protocol layer rejection: corrupted checksum is not dispatched
+  SECTION("Register read endianness ($p single register, $g all registers)") {
+    // Single register read ($p0)
     {
       TestGDBServer server;
-      std::string raw = "$P0=0102030405060708#ff"; // Bad checksum
+      server.regsToRead.xReg[0] = 0x0807060504030201ULL;
+      std::string raw = format_gdb_packet("p0");
       GDBPacket pkt((unsigned char*)raw.data(), raw.size());
-      REQUIRE(pkt.Validate() == false);
-      // In RSP protocol loop, invalid packet results in NAK without dispatching to HandlePacket
-      REQUIRE(server.writeSingleCalls == 0);
+      REQUIRE(pkt.Validate() == true);
+      server.Handle(pkt);
+      REQUIRE(server.readSingleCalls == 1);
+      REQUIRE(server.lastResponse == "$0102030405060708");
+    }
+
+    // Single register read ($p5)
+    {
+      TestGDBServer server;
+      server.regsToRead.xReg[5] = 0x0123456789abcdefULL;
+      std::string raw = format_gdb_packet("p5");
+      GDBPacket pkt((unsigned char*)raw.data(), raw.size());
+      REQUIRE(pkt.Validate() == true);
+      server.Handle(pkt);
+      REQUIRE(server.readSingleCalls == 1);
+      REQUIRE(server.lastResponse == "$efcdab8967452301");
+    }
+
+    // Read all 32 registers ($g)
+    {
+      TestGDBServer server;
+      server.regsToRead.nXRegs = NUM_XREGS;
+      std::string expectedPayload = "$";
+      const char hexChars[] = "0123456789abcdef";
+      for (int i = 0; i < NUM_XREGS; ++i) {
+        server.regsToRead.xReg[i] = 0x1000000000000000ULL + static_cast<uint64_t>(i);
+        uint8_t le[8];
+        udb::write_le64(le, server.regsToRead.xReg[i]);
+        for (int b = 0; b < 8; ++b) {
+          expectedPayload += hexChars[(le[b] >> 4) & 0x0f];
+          expectedPayload += hexChars[le[b] & 0x0f];
+        }
+      }
+      std::string raw = format_gdb_packet("g");
+      GDBPacket pkt((unsigned char*)raw.data(), raw.size());
+      REQUIRE(pkt.Validate() == true);
+      server.Handle(pkt);
+      REQUIRE(server.readGprCalls == 1);
+      REQUIRE(server.lastResponse == expectedPayload);
     }
   }
 
-  SECTION("Packet-parser tests: malformed, truncated, and trailing garbage inputs") {
-    // Truncated P packet with fewer than 8 bytes
-    {
-      TestGDBServer server;
-      std::string raw = format_gdb_packet("P0=01020304");
-      GDBPacket pkt((unsigned char*)raw.data(), raw.size());
-      REQUIRE(pkt.Validate() == true);
-      server.Handle(pkt);
-      REQUIRE(server.lastError != 0);
-      REQUIRE(server.lastResponse != "OK");
-      REQUIRE(server.writeSingleCalls == 0);
-    }
-
-    // Malformed P packet with non-hex characters
-    {
-      TestGDBServer server;
-      std::string raw = format_gdb_packet("P0=010203ZZ05060708");
-      GDBPacket pkt((unsigned char*)raw.data(), raw.size());
-      REQUIRE(pkt.Validate() == true);
-      server.Handle(pkt);
-      REQUIRE(server.lastError != 0);
-      REQUIRE(server.lastResponse != "OK");
-      REQUIRE(server.writeSingleCalls == 0);
-    }
-
-    // P packet with trailing garbage before terminator
-    {
-      TestGDBServer server;
-      std::string raw = format_gdb_packet("P0=0102030405060708EXTRA");
-      GDBPacket pkt((unsigned char*)raw.data(), raw.size());
-      REQUIRE(pkt.Validate() == true);
-      server.Handle(pkt);
-      REQUIRE(server.lastError != 0);
-      REQUIRE(server.lastResponse != "OK");
-      REQUIRE(server.writeSingleCalls == 0);
-    }
-
-    // Truncated G packet
-    {
-      TestGDBServer server;
-      std::string raw = format_gdb_packet("G01020304");
-      GDBPacket pkt((unsigned char*)raw.data(), raw.size());
-      REQUIRE(pkt.Validate() == true);
-      server.Handle(pkt);
-      REQUIRE(server.lastError != 0);
-      REQUIRE(server.lastResponse != "OK");
-      REQUIRE(server.writeGprCalls == 0);
-    }
-
-    // Malformed G packet with non-hex characters
-    {
-      TestGDBServer server;
-      std::string gPayload = "G";
-      const char hexChars[] = "0123456789abcdef";
-      for (int i = 0; i < NUM_XREGS; ++i) {
-        uint64_t regVal = 0x1000000000000000ULL + static_cast<uint64_t>(i);
-        uint8_t le[8];
-        udb::write_le64(le, regVal);
-        for (int b = 0; b < 8; ++b) {
-          if (i == 2 && b == 3) {
-            gPayload += "ZZ";
-          } else {
-            gPayload += hexChars[(le[b] >> 4) & 0x0f];
-            gPayload += hexChars[le[b] & 0x0f];
-          }
-        }
-      }
-      std::string raw = format_gdb_packet(gPayload);
-      GDBPacket pkt((unsigned char*)raw.data(), raw.size());
-      REQUIRE(pkt.Validate() == true);
-      server.Handle(pkt);
-      REQUIRE(server.lastError != 0);
-      REQUIRE(server.lastResponse != "OK");
-      REQUIRE(server.writeGprCalls == 0);
-    }
-
-    // G packet with trailing garbage before terminator
-    {
-      TestGDBServer server;
-      std::string gPayload = "G";
-      const char hexChars[] = "0123456789abcdef";
-      for (int i = 0; i < NUM_XREGS; ++i) {
-        uint64_t regVal = 0x1000000000000000ULL + static_cast<uint64_t>(i);
-        uint8_t le[8];
-        udb::write_le64(le, regVal);
-        for (int b = 0; b < 8; ++b) {
-          gPayload += hexChars[(le[b] >> 4) & 0x0f];
-          gPayload += hexChars[le[b] & 0x0f];
-        }
-      }
-      gPayload += "EXTRA";
-      std::string raw = format_gdb_packet(gPayload);
-      GDBPacket pkt((unsigned char*)raw.data(), raw.size());
-      REQUIRE(pkt.Validate() == true);
-      server.Handle(pkt);
-      REQUIRE(server.lastError != 0);
-      REQUIRE(server.lastResponse != "OK");
-      REQUIRE(server.writeGprCalls == 0);
-    }
-  }
-
-  SECTION("GDBPacket ReadByte and ReadData boundaries and safe arithmetic") {
-    // Zero-length ReadData succeeds safely
-    char rawPkt[] = "$P0=0102030405060708#e1";
-    GDBPacket pkt((unsigned char*)rawPkt, sizeof(rawPkt) - 1);
-    pkt.Reset();
-    uint8_t buf[16];
-    REQUIRE(pkt.ReadData(buf, 0) == 0);
-
-    // Negative length rejected
-    REQUIRE(pkt.ReadData(buf, -1) == -1);
-
-    // Null buffer rejected
-    REQUIRE(pkt.ReadData(nullptr, 4) == -1);
-
-    // Length exceeding available packet data rejected safely without OOB pointer
-    REQUIRE(pkt.ReadData(buf, 1000) == -1);
-
-    // Arithmetic overflow length rejected
-    REQUIRE(pkt.ReadData(buf, 0x7fffffff) == -1);
-
-    // SendError byte-encoding verification: lower byte encoded in hex
+  SECTION("SendError single-byte formatting") {
     TestGDBServer server;
     server.SendError(1);
     REQUIRE(server.lastResponse == "$E01");

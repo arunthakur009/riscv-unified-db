@@ -2,6 +2,18 @@
 
 #include <cstdint>
 
+/*
+ * Endianness conversion helpers for the UDB Instruction Set Simulator.
+ *
+ * The ISS preserves the RISC-V guest's little-endian memory and interface
+ * semantics regardless of the host's native byte order. These helpers
+ * provide host-independent conversion between integer values and
+ * little-endian byte representations, including on big-endian hosts.
+ *
+ * Byte-wise access avoids alignment requirements and unaligned memory
+ * access faults on strict-alignment architectures.
+ */
+
 namespace udb {
 
   inline uint16_t read_le16(const uint8_t* p) {

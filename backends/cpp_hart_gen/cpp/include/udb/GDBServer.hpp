@@ -38,7 +38,6 @@ public:
 
   bool Validate();
   bool EndOfPacket();
-  void Reset();
   void SetBufferSize(size_t size);
   bool Seek(char c);
   bool Seek(int relPos);
@@ -56,7 +55,7 @@ public:
   unsigned char operator[](unsigned int i);
 
 private:
-  int HexCharToValue(unsigned char hexChar);
+  char HexCharToValue(unsigned char hexChar);
 
   unsigned char* m_pPacket;
   unsigned long m_len;
